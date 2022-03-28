@@ -1,0 +1,9 @@
+defaults:
+  vulnerabilities_to_report: 54321
+  pageSize: 1000
+  apiURL: "QUALYS_GATEWAY_URL"
+  exitOnError: false
+  threadCount: 4
+  imageReportHeaders: ['registry', 'repository', 'imageId', 'tag', 'hostname', 'severity','image-log4j-vuln', 'qid', 'firstFound', 'cveids', 'title', 'typeDetected', 'patchAvailable', 'softwarePackage', 'currentVersion', 'fixVersion' ]
+  containerReportHeaders: ['registry','registry', 'repository', 'imageId', 'containerId', 'name', 'hostname', 'ipAddress', 'image-log4j-vuln', 'container-log4j-vuln', 'qid', 'severity', 'cves', 'firstFound', 'title', 'typeDetected', 'patchAvailable', 'softwarePackage', 'currentVersion', 'fixVersion']
+  log4j_qids: ['376157', '376178', '376194', '376209']

@@ -1,0 +1,804 @@
+#!/usr/bin/env python
+#
+# Author: Sean Nicholson
+# Purpose: To iterate the Container Security API and export a CSV of image and container vulns
+# version: 1.1.2
+# date: 10.07.2019
+# 07.23.2019 - Added Loader=yaml.SafeLoader to address yaml warning
+# 09.04.2019 - Changed API U/P to read from env variables instead of config file
+# 09.12.2019 - v1.1 Added some logging
+# 09.27.2019 - v1.1.1 Added threading, error handling, and multiple performance improvements
+# 10.07.2019 - v1.1.2 Add software package information to report softwarePackage, currentVersion, fixVersion
+#              added --software argument to create report with one row per vuln software package, per image/container
+# 03.30.2020 - v1.1.3 Add imagesonly option, pull by image updated greater than specified epochTime value,
+#              --recordprogress option, and bug fixes
+# 11.04.2021 - v1.1.4 Changed to use gateway with auth token, added some data validations and sanity debugging logging
+
+from __future__ import print_function
+from builtins import str
+import sys, requests, datetime, os, time, logging, csv
+import yaml
+import json
+import base64
+import logging.config
+import math
+import concurrent.futures
+import argparse
+#import os.path
+from os import path
+
+# setup_http_session sets up global http session variable for HTTP connection sharing
+def setup_http_session():
+    global httpSession
+
+    httpSession = requests.Session()
+
+# setup_credentials builds HTTP auth string and base64 encodes it to minimize recalculation
+def setup_credentials(username, password, URL):
+    global token
+
+    authURL = URL + "/auth"
+    #usrPass = str(username)+':'+str(password)
+    #usrPassBytes = bytes(usrPass, "utf-8")
+    #httpCredentials = base64.b64encode(usrPassBytes).decode("utf-8")
+    authBody = "username="+ str(username) + "&password=" + str(password) + "&token=true&permissions=true"
+
+    authHeader = {"Content-Type": "application/x-www-form-urlencoded"}
+    response=httpSession.post(authURL, headers=authHeader, data=authBody, verify=True)
+    logger.debug("Repsonse code for GET to {0} - Response Code {1}".format(str(authURL),str(response.status_code)))
+    logger.debug("API Data for Response \n {}".format(str(response.text[:1000])))
+    token = response.text
+    logger.debug("Token = {}".format(str(token)))
+
+def setup_logging(default_path='./config/logging.yml',default_level=logging.INFO,env_key='LOG_CFG'):
+    """Setup logging configuration"""
+    if not os.path.exists("log"):
+        os.makedirs("log")
+    path = default_path
+    value = os.getenv(env_key, None)
+    if value:
+        path = value
+    if os.path.exists(path):
+        with open(path, 'rt') as f:
+            config = yaml.safe_load(f.read())
+        logging.config.dictConfig(config)
+    else:
+        logging.basicConfig(level=default_level)
+
+
+# Called to read in ./config.yml
+def config():
+    with open('config.yml', 'r') as config_settings:
+        config_info = yaml.load(config_settings, Loader=yaml.SafeLoader)
+        try:
+            username = os.environ["QUALYS_API_USERNAME"]
+            #password = base64.b64decode(os.environ["QUALYS_API_PASSWORD"])
+            password = os.environ["QUALYS_API_PASSWORD"]
+        except KeyError as e:
+            logger.critical("Critical Env Variable Key Error - missing configuration item {0}".format(str(e)))
+            logger.critical("Please review README for required configuration to run script")
+            sys.exit(1)
+        try:
+            vuln_severity = str(config_info['defaults']['vulnerabilities_to_report']).rstrip()
+            threadCount = str(config_info['defaults']['threadCount']).rstrip()
+            imageReportHeaders = config_info['defaults']['imageReportHeaders']
+            containerReportHeaders = config_info['defaults']['containerReportHeaders']
+            URL = str(config_info['defaults']['apiURL']).rstrip()
+            log4j_qids = config_info['defaults']['log4j_qids']
+            if "pageSize" in config_info['defaults']:
+                pageSize = config_info['defaults']['pageSize']
+            else:
+                pageSize = 50
+
+            if "exitOnError" in config_info['defaults']:
+                exitOnError = config_info['defaults']['exitOnError']
+            else:
+                exitOnError = True
+        except KeyError as e:
+            logger.critical("Critical ./config.yml Key Error - missing configuration item {0}".format(str(e)))
+            logger.critical("Please review README for required configuration to run script")
+            sys.exit(1)
+        if URL == "<QUALYS_API_URL>":
+            logger.critical("Critical ./config.yml Key Error - missing configuration item Qualys API URL")
+            logger.critical("Please check for https://www.qualys.com/docs/qualys-container-security-api-guide.pdf for the correct Qualys API URL for your subscription")
+            logger.critical("Please review README for required configuration to run script")
+            sys.exit(1)
+        if username == '' or password == '' or URL == '':
+            logger.critical("Config information in ./config.yml not configured correctly. Exiting...")
+            sys.exit(1)
+    return username, password, vuln_severity, URL, pageSize, exitOnError, threadCount, imageReportHeaders, containerReportHeaders, log4j_qids
+
+# Get call for API queries to return json data and status code
+def Get_Call(token, URL):
+
+    headers = {
+        'Accept': '*/*',
+        'content-type': 'application/json',
+        'Authorization': "Bearer %s" % token
+    }
+
+    r = httpSession.get(URL, headers=headers, verify=True)
+    logger.debug("Repsonse code for GET to {0} - Response Code {1}".format(str(URL),str(r.status_code)))
+    logger.debug("API Data for Response \n {}".format(str(r.text[:10000])))
+    image_list_json = json.loads(r.text)
+
+    return image_list_json,r.status_code
+
+#write CSV Report
+def writeCsv(findings, reportType, csvHeaders):
+    if not os.path.exists("reports"):
+            os.makedirs("reports")
+    out_file = "reports/Vulnerability_" + str(reportType) + "_Report_" + time.strftime("%Y%m%d-%H%M%S") + ".csv"
+    ofile = open(out_file, "w")
+    writer = csv.DictWriter(ofile, fieldnames=csvHeaders)
+    writer.writeheader()
+    row = {}
+    for item in findings:
+        for header in csvHeaders:
+            if str(header) in item.keys():
+                row[header] = item[header]
+            else:
+                logger.error("CSV Column Header not in finding keys -- {}".format(str(header)))
+                logger.error("Please update csvHeaders with API Response key values only".format(str(header)))
+
+        writer.writerow(row)
+    logger.debug("Done writing data to CSV for: {}".format(str(csvHeaders)))
+    ofile.close()
+
+def setConfig(updated):
+    f=open("./config/Last_Updated_Result", "w")
+    f.write(str(updated))
+    f.close()
+
+# API Call to /csapi/v1.3/images to get list of all images
+def image_vuln_csv():
+
+    username, password, vuln_rating, URL, pageSize, exitOnError, threadCount, imageReportHeaders, containerReportHeaders, log4j_qids = config()
+    setup_credentials(username, password, URL)
+    pageNo = 1
+    logger.debug("Starting image_vuln_csv")
+    logger.debug('------------------------------Begin Image Debug Log {0} --------------------------------\n'.format(datetime.datetime.utcnow()))
+    updated = 0
+
+    counter = 0
+
+    full_image_list = []
+    allResults = False
+    while allResults == False:
+        if args.updated or args.recordprogress:
+            if path.exists("./config/Last_Updated_Result") and args.recordprogress:
+                f=open("./config/Last_Updated_Result", "r")
+                contents=f.read()
+                if contents:
+                    updated = contents
+                    logger.debug("Filtering images for updated > {}".format(str(contents)))
+                elif args.updated:
+                    updated = args.updated
+                else:
+                    updated = 0
+            elif args.updated:
+                updated = args.updated
+                logger.debug("Filtering images for updated > {}".format(str(args.updated)))
+            elif args.recordprogress:
+                updated = 0
+                logger.debug("Filtering images for updated > 0")
+
+            image_list_pull_URL = URL + "/csapi/v1.3/images?pageSize=" + str(pageSize) + "&pageNo={}".format(str(pageNo) + "&filter=updated>" + str(updated) + "&sort=updated:asc")
+        #else:
+        #        image_list_pull_URL = URL + "/csapi/v1.3/images?pageSize=" + str(pageSize) + "&pageNo={}".format(str(pageNo) + "&sort=updated:asc")
+        else:
+            image_list_pull_URL = URL + "/csapi/v1.3/images?pageSize=" + str(pageSize) + "&sort=updated:asc&pageNo={}".format(str(pageNo))
+        logger.debug("Image Pull URL {}".format(image_list_pull_URL))
+        logger.debug('{0} - Calling {1} \n'.format(datetime.datetime.utcnow(), image_list_pull_URL))
+        counter = 0
+
+        while counter <= 10:
+            if (int(pageSize) * int(pageNo)) <= 10000:
+                image_list_data, image_list_status = Get_Call(token,image_list_pull_URL)
+            else:
+                allResults = True
+            #logger.debug("int(image_list_data[\'count\'] {0} // pageSize {1}) = {2}".format(str(image_list_data['count']), str(pageSize), str(int(image_list_data['count'] // pageSize))))
+            #logger.debug("Called {0} and got reponse code {1} with data: \n {2}".format(str(image_list_pull_URL),str(image_list_status),str(image_list_data)))
+            logger.debug("image list \n {}".format(list(image_list_data)))
+            logger.debug('{0} - API URL {1} response status: {2} \n'.format(datetime.datetime.utcnow(), image_list_pull_URL, image_list_status))
+            if image_list_status == 401:
+                setup_credentials(username, password, URL)
+                logger.debug('{0} - API URL {1} error details: {2} \n'.format(datetime.datetime.utcnow(),image_list_pull_URL, image_list_data))
+            if image_list_status != 200:
+                logger.debug('{0} - API URL {1} error details: {2} \n'.format(datetime.datetime.utcnow(),image_list_pull_URL, image_list_data))
+            if image_list_status == 200:
+                logger.debug("pageNo {0} < int(image_list_data[\'count\'] {1} // pageSize {2}) = {3}".format(str(pageNo), str(image_list_data['count']), str(pageSize), str(int(image_list_data['count'] // pageSize))))
+                pageNo +=1
+                full_image_list.extend(image_list_data['data'])
+
+                if pageNo > int(image_list_data['count'] // pageSize):
+                    allResults = True
+                counter = 11
+
+            else:
+                logger.debug('{0} - API URL {1} error encountered retry number {2}\n'.format(datetime.datetime.utcnow(),image_list_pull_URL, counter))
+                logger.debug("Not feeling well...sleeping 10 secs\n")
+                logger.warning("Not feeling well - sleeping 10 secs")
+                time.sleep(10)
+                counter += 1
+                if counter == 10:
+                    logger.debug('{0} - API URL {1} retry limit exceeded\n'.format(datetime.datetime.utcnow(),image_list_pull_URL))
+                    # Not gating this first exit() on exitOnError. If this doesn't succeed, no reason to go further.
+                    sys.exit(1)
+
+    logger.debug('{0} - Image list count: {1} \n'.format(datetime.datetime.utcnow(), str(len(full_image_list))))
+    if len(full_image_list) > 0:
+        imageDataShare, maxUpdated = imageDetails(full_image_list)
+    return imageDataShare, maxUpdated
+
+# Parse image list for Images with Vulns
+def imageDetails(full_image_list):
+    reportData=[]
+    lastUpdated = ''
+    username, password, vuln_rating, URL, pageSize, exitOnError, threadCount, imageReportHeaders, containerReportHeaders, log4j_qids = config()
+    setup_http_session()
+    setup_credentials(username, password, URL)
+    imageWithVulns=[]
+    maxUpdated = 0
+    for image in full_image_list:
+
+        if "updated" in image.keys() and args.recordprogress and image["updated"] is not None:
+            lastUpdated = int(image["updated"])
+            logger.debug("Image updated: {}".format(str(lastUpdated)))
+            if (lastUpdated is not None) and (int(lastUpdated) > maxUpdated):
+                maxUpdated = lastUpdated
+                logger.debug("New last maxUpdated: {} updated epoch time: {} -- old maxUpdated: {}".format(str(image["imageId"]), str(image["updated"]), str(maxUpdated)))
+
+        image_detail_list = ''
+        image_details_url_status = ''
+        image_details_url = ''
+        logger.debug("Checking ImageID: {} imageSha: {}".format(str(image['imageId']),str(image['sha']) ))
+        if image['vulnerabilities']['severity1Count'] is not None and image['vulnerabilities']['severity2Count'] is not None and image['vulnerabilities']['severity3Count'] is not None and image['vulnerabilities']['severity4Count'] is not None and image['vulnerabilities']['severity5Count'] is not None:
+            if vuln_rating == '54321':
+                if image['vulnerabilities']['severity1Count'] > 0 or image['vulnerabilities']['severity2Count'] > 0 or image['vulnerabilities']['severity3Count'] > 0 or image['vulnerabilities']['severity4Count'] > 0 or image['vulnerabilities']['severity5Count'] > 0:
+                    image_details_url = URL + "/csapi/v1.3/images/" + str(image['sha'])
+            elif vuln_rating == '5432':
+                if image['vulnerabilities']['severity2Count'] > 0 or image['vulnerabilities']['severity3Count'] > 0 or image['vulnerabilities']['severity4Count'] > 0 or image['vulnerabilities']['severity5Count'] > 0:
+                    image_details_url = URL + "/csapi/v1.3/images/" + str(image['sha'])
+            elif vuln_rating == '543':
+                if image['vulnerabilities']['severity3Count'] > 0 or image['vulnerabilities']['severity4Count'] > 0 or image['vulnerabilities']['severity5Count'] > 0:
+                    image_details_url = URL + "/csapi/v1.3/images/" + str(image['sha'])
+            elif vuln_rating == '54':
+                if image['vulnerabilities']['severity4Count'] > 0 or image['vulnerabilities']['severity5Count'] > 0:
+                    image_details_url = URL + "/csapi/v1.3/images/" + str(image['sha'])
+            elif vuln_rating == '5':
+                if image['vulnerabilities']['severity5Count'] > 0:
+                    image_details_url = URL + "/csapi/v1.3/images/" + str(image['sha'])
+            else:
+                logger.warning('{0} - **** Exception - no vulnerbility inclusion limit set \n'.format(datetime.datetime.utcnow()))
+                logger.debug('------------------------------End Image Debug Log {0} --------------------------------\n'.format(datetime.datetime.utcnow()))
+                sys.exit(1)
+        if image['vulnerabilities']['severity1Count'] is not None and image['vulnerabilities']['severity2Count'] is not None and image['vulnerabilities']['severity3Count'] is not None and image['vulnerabilities']['severity4Count'] is not None and image['vulnerabilities']['severity5Count'] is not None:
+            vuln_counts = image['vulnerabilities']['severity5Count'] + image['vulnerabilities']['severity4Count'] + image['vulnerabilities']['severity3Count'] + image['vulnerabilities']['severity2Count'] + image['vulnerabilities']['severity1Count']
+        if image_details_url and vuln_counts >= 1 and image_details_url not in imageWithVulns:
+            imageWithVulns.append(str(image_details_url))
+        else:
+            logger.debug('{0} - *** {1} *** - *** No image vulnerabilities reported \n'.format(datetime.datetime.utcnow(), str(image['imageId'])))
+    if len(imageWithVulns) > 0:
+        logger.debug("Length of imageWithVulns = {}".format(len(imageWithVulns)))
+        #input("Press Enter to continue...")
+        reportData = {"report": [], "imageDataShare": {}}
+
+        if args.thread:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=int(threadCount)) as executor:
+                future_to_url = {executor.submit(imageVulns, url): url for url in imageWithVulns}
+                for future in concurrent.futures.as_completed(future_to_url):
+                    url = future_to_url[future]
+                    try:
+                        data = future.result()
+                        logger.debug("data is type {}".format(type(data)))
+                        logger.debug("data is length {}".format(len(data)))
+                        if len(data) > 0:
+                            logger.debug("data is \n {}".format(str(data)[:100]))
+                            reportData['report'].extend(data['report'])
+                            reportData['imageDataShare'].update(data['imageDataShare'])
+                    except Exception as exc:
+                        print('%r generated an exception: %s' % (url, exc))
+                    else:
+                        #reportDataTrial.extend(data)
+                        logger.debug("data is type {}".format(type(data)))
+                        logger.debug("data is \n {}".format(str(data)[:100]))
+        else:
+            ### Thread troubleshooting single thread linear iteration of containers
+            for imageURL in imageWithVulns:
+                data = imageVulns(imageURL)
+                if len(data) > 0:
+                    reportData['report'].extend(data['report'])
+                    reportData['imageDataShare'].update(data['imageDataShare'])
+
+        logger.debug("reportData[report] is type {}".format(type(reportData['report'])))
+        logger.debug("reportData[report] is length = {}".format(len(reportData['report'])))
+        #input("Press Enter to continue...")
+        logger.debug("reportData[imageDataShare] is type {}".format(type(reportData['imageDataShare'])))
+        logger.debug("reportData[imageDataShare] is length = {}".format(len(reportData['imageDataShare'])))
+        #input("Press Enter to continue...")
+        logger.info("*** Threading Report Data is complete *** \n\n\n\n {}".format(str(reportData['report'])[:1000]))
+        #input("Press Enter to continue...")
+
+        #input("Press Enter to continue...")
+        writeCsv(reportData['report'], "Image", imageReportHeaders)
+
+    return reportData['imageDataShare'], str(maxUpdated)
+
+# API Call to /csapi/v1.3/images/imageId to get Image and Vuln details
+def imageVulns(image_details_url):
+    logger.debug("Starting Image ID {}".format(str(image_details_url)))
+    imageReport = {"report": [], "imageDataShare": {}}
+    username, password, vuln_rating, URL, pageSize, exitOnError, threadCount, imageReportHeaders, containerReportHeaders, log4j_qids = config()
+
+    if image_details_url:
+        counter = 0
+        while counter <= 10:
+
+            image_detail_list, image_details_url_status = Get_Call(token,image_details_url)
+            #logger.debug("Image Details List Response {0} \n Body: \n {1} \n".format(str(image_details_url_status), str(image_detail_list)))
+            logger.debug('{0} - API URL {1} response status: {2} \n'.format(datetime.datetime.utcnow(),image_details_url, image_details_url_status))
+            if image_details_url_status == 401:
+                setup_credentials(username, password, URL)
+                logger.debug('{0} - API URL {1} error details: {2} \n'.format(datetime.datetime.utcnow(),image_list_pull_URL, image_list_data))
+            if image_details_url_status != 200:
+                logger.debug('{0} - API URL {1} error details: {2} \n'.format(datetime.datetime.utcnow(),image_details_url, image_detail_list))
+            if image_details_url_status == 200:
+                counter = 11
+
+            else:
+                logger.debug('{0} - API URL {1} error encountered retry number {2}\n'.format(datetime.datetime.utcnow(),image_details_url, counter))
+                logger.debug("Not feeling well...sleeping 10 secs\n")
+                print("Not feeling well - sleeping 10 secs")
+                time.sleep(10)
+                counter += 1
+                if counter == 10:
+                    logger.debug('{0} - API URL {1} retry limit exceeded\n'.format(datetime.datetime.utcnow(),image_details_url))
+                    if exitOnError:
+                        logger.debug('{0} - Exiting\n'.format(datetime.datetime.utcnow()))
+                        sys.exit(1)
+                    else:
+                        logger.debug('{0} - Continuing\n'.format(datetime.datetime.utcnow()))
+                        continue
+
+
+        registry = ''
+        tags = ''
+        repository = ''
+        lastUpdated = ''
+
+        if image_detail_list['repo']:
+            logger.debug("Image ID {0} - Repo {1}".format(str(image_detail_list['imageId']), str(image_detail_list['repo'])))
+            repos = image_detail_list['repo']
+            for repo in repos:
+                if repo['registry'] is None:
+                    continue
+                elif repo['registry'] not in registry:
+                    registry += repo['registry'] + ";"
+                if repo['tag']:
+                    if repo['tag'] not in tags:
+                        tags += repo['tag'] + ";"
+                if repo['repository'] not in repository:
+                    repository += repo['repository'] + ";"
+        try:
+            if image_detail_list['host']:
+                logger.debug("Image ID {0} - Host {1}".format(str(image_detail_list['imageId']), str(image_detail_list['host'])))
+                hostname = ""
+                for host in image_detail_list['host']:
+                    if "hostname" in host.keys():
+                        if host['hostname'] is None:
+                            continue
+                        else:
+                            logger.debug("image ID {0} - Hostname = {1}".format(str(image_detail_list['imageId']), str(host['hostname'])))
+                            if host['hostname'] not in hostname:
+                                logger.debug("Hostname not None")
+                                hostname += (host['hostname'] + ";")
+                                logger.debug("Hostname update: {}".format(str(hostname)))
+
+            else:
+                hostname = ""
+
+        except KeyError:
+            logger.debug("Key Error: {}".format(str(KeyError)))
+            hostname = ""
+            pass
+
+        logger.debug("Processing image vuln")
+        logger.debug("Length of Vuln List: {}".format(len(image_detail_list['vulnerabilities'])))
+        logger.debug("Image ID {}".format(str(image_detail_list['imageId'])))
+        logger.debug("Image Vuln List \n {}".format(str(image_detail_list['vulnerabilities'])))
+        logger.debug("Vulns for Image ID {0} \n {1} \n".format(str(image_detail_list['imageId']),str(image_detail_list['vulnerabilities'])))
+        #log4j =any(item in image_detail_list['vulnerabilities'] for item in log4j_qids)
+        if 376157 in image_detail_list['vulnerabilities'] or 376178 in image_detail_list['vulnerabilities'] or 376194 in image_detail_list['vulnerabilities'] or 376209 in image_detail_list['vulnerabilities']:
+            log4j = True
+        else:
+            log4j = False
+
+        imageReport['imageDataShare'].update({image_detail_list['imageId']: {'registry': str(registry), 'repository': str(repository), 'image-log4j-vuln': log4j}})
+        logger.debug("imageShareData for log4j - {0}".format(str(imageReport['imageDataShare'][image_detail_list['imageId']])))
+        #log4j = False
+        for vulns in image_detail_list['vulnerabilities']:
+            if vulns['patchAvailable']:
+                patchable = vulns['patchAvailable']
+            else:
+                patchable = 'False'
+            #print vulns['firstFound']
+            #print vulns['firstFound'][0:10]
+            firstFound = vulns['firstFound'][0:10]
+            #print datetime.datetime.utcfromtimestamp(float(firstFound)).strftime('%Y-%m-%d %H:%M:%S')
+            firstDate = str(datetime.datetime.utcfromtimestamp(float(firstFound)).strftime('%Y-%m-%d %H:%M:%S'))
+            #print firstDate
+            row = {}
+            softwarePackage = []
+            currentVersion = []
+            fixVersion = []
+            cves = []
+            logger.debug("Processing Image ID: {} for Vulns".format(str(image_detail_list['imageId'])))
+            #if int(vulns['qid']) == 376157 or int(vulns['qid']) == 376178 or int(vulns['qid']) == 376194 or int(vulns['qid']) == 376209:
+            #    log4j = True
+            #    imageReport['imageDataShare'].update({image_detail_list['imageId']: {'registry': str(registry), 'repository': str(repository), 'image-log4j-vuln': True}})
+                #imageReport['imageDataShare'][image_detail_list['imageId']]['image-log4j-vuln'].update(True)
+            #    logger.debug("imageShareData for log4j - {0}".format(str(imageReport['imageDataShare'][image_detail_list['imageId']])))
+            if args.software:
+                if vulns['cveids']:
+                    for cve in vulns['cveids']:
+                        cves.append(str(cve))
+                    logger.debug("CVEs found: {}".format(str(cves)))
+                if vulns['software']:
+                    for software in vulns['software']:
+                        row.update({"registry": registry, "repository": repository, "imageId": image_detail_list['imageId'], "tag": tags, "hostname": hostname, "image-log4j-vuln": log4j, "qid": vulns['qid'], "severity": vulns['severity'], "cveids": str(cves).strip('[]'), "firstFound": firstDate, "title": vulns['title'], "typeDetected":vulns['typeDetected'],"patchAvailable": str(patchable), 'softwarePackage': software['name'], 'currentVersion': software['version'], 'fixVersion': software['fixVersion']})
+                        imageReport['report'].append(dict(row))
+                else:
+                    row.update({"registry": registry, "repository": repository, "imageId": image_detail_list['imageId'], "tag": tags, "hostname": hostname, "image-log4j-vuln": log4j, "qid": vulns['qid'], "severity": vulns['severity'], "cveids": str(cves).strip('[]'), "firstFound": firstDate, "title": vulns['title'], "typeDetected":vulns['typeDetected'],"patchAvailable": str(patchable), 'softwarePackage': '', 'currentVersion': '', 'fixVersion': ''})
+                    imageReport['report'].append(dict(row))
+            else:
+                if vulns['software']:
+                    for software in vulns['software']:
+                        softwarePackage.append(str(software['name']))
+                        currentVersion.append(str(software['version']))
+                        fixVersion.append(str(software['fixVersion']))
+                if vulns['cveids']:
+                    for cve in vulns['cveids']:
+                        logger.debug("Processing CVE {0} for Image ID: {1} for Vulns".format(str(cve),str(image_detail_list['imageId'])))
+                        row.update({"registry": registry, "repository": repository, "imageId": image_detail_list['imageId'], "tag": tags, "hostname": hostname, "image-log4j-vuln": log4j, "qid": vulns['qid'], "severity": vulns['severity'], "cveids": str(cve), "firstFound": firstDate, "title": vulns['title'], "typeDetected":vulns['typeDetected'],"patchAvailable": str(patchable), 'softwarePackage': str(softwarePackage).strip('[]'), 'currentVersion': str(currentVersion).strip('[]'), 'fixVersion': str(fixVersion).strip('[]')})
+                        imageReport['report'].append(dict(row))
+                else:
+                    logger.debug("Processing No CVEs for Image ID: {} for Vulns".format(str(image_detail_list['imageId'])))
+                    row.update({"registry": registry, "repository": repository, "imageId": image_detail_list['imageId'], "tag": tags, "hostname": hostname, "image-log4j-vuln": log4j, "qid": vulns['qid'], "severity": vulns['severity'], "cveids": "", "firstFound": firstDate, "title": vulns['title'], "typeDetected":vulns['typeDetected'],"patchAvailable": str(patchable), 'softwarePackage': str(softwarePackage).strip('[]'), 'currentVersion': str(currentVersion).strip('[]'), 'fixVersion': str(fixVersion).strip('[]')})
+                    imageReport['report'].append(dict(row))
+
+    return imageReport
+
+    logger.debug('------------------------------End Image Debug Log {0} --------------------------------\n'.format(datetime.datetime.utcnow()))
+
+
+# Get API call for /csapi/v1.3/containers/ to pull list of all containers
+def container_vuln_csv(imageShareData):
+    username, password, vuln_rating, URL, pageSize, exitOnError, threadCount, imageReportHeaders, containerReportHeaders, log4j_qids = config()
+
+    pageNo=1
+    containersWithVuln = []
+    full_container_list = []
+    containerList = []
+    logger.debug('------------------------------Begin Container Debug Log {0} --------------------------------\n'.format(datetime.datetime.utcnow()))
+    counter = 0
+    allResults = False
+    while allResults == False:
+        if args.updated:
+            container_list_pull_URL = URL + "/csapi/v1.3/containers?pageSize=" + str(pageSize) + "&pageNo={}".format(str(pageNo) + "&filter=updated>" + str(args.updated) + "&sort=updated:asc")
+        else:
+            container_list_pull_URL = URL + "/csapi/v1.3/containers?pageSize=" + str(pageSize) + "&pageNo={}&sort=updated:asc".format(str(pageNo))
+        logger.debug("Container Pull URL {}".format(container_list_pull_URL))
+        logger.debug('{0} - Calling {1} \n'.format(datetime.datetime.utcnow(), container_list_pull_URL))
+        counter = 0
+        while counter <= 10:
+            if pageNo >= 2:
+                if int(container_list_data['count']) <= 10000:
+                    if pageNo >= (int(container_list_data['count'] // pageSize) + 1):
+                        allResults = True
+                        counter = 11
+                else:
+                    if (pageNo * pageSize) >= 10001:
+                        allResults = True
+                        counter = 11
+            container_list_data, container_list_status = Get_Call(token,container_list_pull_URL)
+            logger.debug('{0} - API URL {1} response status: {2} \n'.format(datetime.datetime.utcnow(), container_list_pull_URL, container_list_status))
+            if container_list_status == 401:
+                setup_credentials(username, password, URL)
+                logger.debug('{0} - API URL {1} error details: {2} \n'.format(datetime.datetime.utcnow(),image_list_pull_URL, image_list_data))
+            if container_list_status != 200:
+                logger.debug('{0} - API URL {1} error details: {2} \n'.format(datetime.datetime.utcnow(),container_list_pull_URL, container_list_data))
+            if container_list_status == 200:
+                full_container_list.extend(container_list_data['data'])
+                logger.debug("pageNo {0} <= int(image_list_data[\'count\'] {1} // pageSize {2}) = {3}".format(str(pageNo), str(container_list_data['count']), str(pageSize), str(int(container_list_data['count'] // pageSize))))
+                pageNo +=1
+
+                if pageNo >= (int(container_list_data['count'] // pageSize) + 1):
+                    allResults = True
+                    counter = 11
+
+            else:
+                logger.error('{0} - API URL {1} error encountered retry number {2}\n'.format(datetime.datetime.utcnow(),container_list_pull_URL, counter))
+                logger.warning("Not feeling well...sleeping 10 secs\n")
+                logger.info("Not feeling well - sleeping 10 secs")
+                time.sleep(10)
+                counter += 1
+                if counter == 10:
+                    logger.error('{0} - API URL {1} retry limit exceeded\n'.format(datetime.datetime.utcnow(),container_list_pull_URL))
+                    # Not gating this first exit() on exitOnError. If this doesn't succeed, no reason to go further.
+                    sys.exit(1)
+
+    logger.debug('{0} - Container list count: {1} \n'.format(datetime.datetime.utcnow(), len(full_container_list)))
+    testData = []
+
+    if len(full_container_list) > 0:
+        if not os.path.exists("reports"):
+            os.makedirs("reports")
+        containerApiError = []
+        #out_file = "reports/Vulnerability_Container_Report_"+ time.strftime("%Y%m%d-%H%M%S") + ".csv"
+        #ofile  = open(out_file, "w")
+        #ofile.write("Registry,Repository,ImageID,Container,Container Name,Hostname,IP,Vulnerabiltiy ID,Severity,CVE Number,First Found Date,Description,Type,Patch Available\n")
+        for container in full_container_list:
+            container_detail_list = ''
+            container_details_url_status = ''
+            container_details_url = ''
+            containerList.append(str(container['containerId']))
+            if 'lastVmScanDate' in container:
+                logger.debug("lastVmScanDate is in container data: {}".format(str(container['lastVmScanDate'])))
+                logger.debug("container data: {}".format(str(container)))
+            if str(container['containerId']) == 'None':
+                containerApiError.append(container)
+            else:
+                if 'lastVmScanDate' in container and container['lastVmScanDate'] is not None:
+                #if container['vulnerabilities']['severity1Count'] is not None and container['vulnerabilities']['severity2Count'] is not None and container['vulnerabilities']['severity3Count'] is not None and container['vulnerabilities']['severity4Count'] is not None and container['vulnerabilities']['severity5Count'] is not None:
+                    if vuln_rating == '54321':
+                        if container['vulnerabilities']['severity1Count'] is not None and container['vulnerabilities']['severity2Count'] is not None and container['vulnerabilities']['severity3Count'] is not None and container['vulnerabilities']['severity4Count'] is not None and container['vulnerabilities']['severity5Count'] is not None:
+                            if container['vulnerabilities']['severity1Count'] > 0 or container['vulnerabilities']['severity2Count'] > 0 or container['vulnerabilities']['severity3Count'] > 0 or container['vulnerabilities']['severity4Count'] > 0 or container['vulnerabilities']['severity5Count'] > 0:
+                                container_details_url = URL + "/csapi/v1.3/containers/" + str(container['sha'])
+                                testData.append(str(container['containerId']))
+                    elif vuln_rating == '5432':
+                        if container['vulnerabilities']['severity2Count'] is not None and container['vulnerabilities']['severity3Count'] is not None and container['vulnerabilities']['severity4Count'] is not None and container['vulnerabilities']['severity5Count'] is not None:
+                            if container['vulnerabilities']['severity2Count'] > 0 or container['vulnerabilities']['severity3Count'] > 0 or container['vulnerabilities']['severity4Count'] > 0 or container['vulnerabilities']['severity5Count'] > 0:
+                                container_details_url = URL + "/csapi/v1.3/containers/" + str(container['sha'])
+                                testData.append(str(container['containerId']))
+                    elif vuln_rating == '543':
+                        if container['vulnerabilities']['severity3Count'] is not None and container['vulnerabilities']['severity4Count'] is not None and container['vulnerabilities']['severity5Count'] is not None:
+                            if container['vulnerabilities']['severity3Count'] > 0 or container['vulnerabilities']['severity4Count'] > 0 or container['vulnerabilities']['severity5Count'] > 0:
+                                container_details_url = URL + "/csapi/v1.3/containers/" + str(container['sha'])
+                                testData.append(str(container['containerId']))
+                    elif vuln_rating == '54':
+                        if container['vulnerabilities']['severity4Count'] is not None and container['vulnerabilities']['severity5Count'] is not None:
+                            if container['vulnerabilities']['severity4Count'] > 0 or container['vulnerabilities']['severity5Count'] > 0:
+                                container_details_url = URL + "/csapi/v1.3/containers/" + str(container['sha'])
+                                testData.append(str(container['containerId']))
+                    elif vuln_rating == '5':
+                        if container['vulnerabilities']['severity5Count'] is not None:
+                            if container['vulnerabilities']['severity5Count'] > 0:
+                                container_details_url = URL + "/csapi/v1.3/containers/" + str(container['sha'])
+                                testData.append(str(container['containerId']))
+                    else:
+                        logger.error('{0} - **** Exception - no vulnerbility inclusion limit set \n'.format(datetime.datetime.utcnow()))
+                        logger.debug('------------------------------Container End Debug Log {0} --------------------------------\n'.format(datetime.datetime.utcnow()))
+                        sys.exit(1)
+                    #container_vuln_counts = container['vulnerabilities']['severity5Count'] + container['vulnerabilities']['severity4Count'] + container['vulnerabilities']['severity3Count'] + container['vulnerabilities']['severity2Count'] + container['vulnerabilities']['severity1Count']
+
+            if container_details_url and container_details_url not in containersWithVuln and "None" not in container_details_url:
+                containersWithVuln.append(container_details_url)
+
+
+            #print container_vuln_counts
+        reportData = []
+
+        #Debug Logging Area
+        logger.debug("Full Container containerId List")
+        logger.debug("Full containerId List \n\n\n {} \n\n\n\n".format(str(containerList)))
+        logger.debug("Full containerId List Length \n\n\n {} \n\n\n\n".format(len(containerList)))
+        logger.debug("Vulnerable container containerId List")
+        logger.debug("containerId List \n\n\n {} \n\n\n\n".format(str(testData)))
+        logger.debug("Container API Error list")
+        logger.debug("Container Error List \n\n\n {} \n\n\n\n".format(str(containerApiError)))
+        logger.debug("Container URL List \n\n\n {} \n\n\n\n".format(str(containersWithVuln)))
+        logger.debug("Container URL List Length {}".format(len(containersWithVuln)))
+
+        if args.thread:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=int(threadCount)) as executor:
+                future_to_url = {executor.submit(containerVulnDetails, url, imageShareData): url for url in containersWithVuln}
+                for future in concurrent.futures.as_completed(future_to_url):
+                    url = future_to_url[future]
+                    try:
+                        data = future.result()
+                        logger.debug("data is type {}".format(type(data)))
+                        logger.debug("data is length {}".format(len(data)))
+                        if len(data) > 0:
+                            logger.debug("data is \n {}".format(str(data)[:100]))
+                            reportData.extend(data)
+                    except Exception as exc:
+                        print('%r generated an exception: %s' % (url, exc))
+                    else:
+                        logger.debug("data is type {}".format(type(data)))
+                        logger.debug("data is \n {}".format(str(data)[:100]))
+
+
+        else:
+            ### Thread troubleshooting single thread linear iteration of containers
+            for containerURL in containersWithVuln:
+                data = containerVulnDetails(containerURL,imageShareData)
+                reportData.extend(data)
+        logger.debug("reportData is type {}".format(type(reportData)))
+        logger.debug("reportData is length = {}".format(len(reportData)))
+        logger.debug("*** Threading Report Data is complete *** \n\n\n\n {}".format(str(reportData)[:1000]))
+        writeCsv(reportData, "Container", containerReportHeaders)
+
+# Get API call for container details for vuln info parsing /csapi/v1.3/containers/containerId
+def containerVulnDetails(containerWithVuln, imageShareData):
+    username, password, vuln_rating, URL, pageSize, exitOnError, threadCount, imageReportHeaders, containerReportHeaders, log4j_qids = config()
+    #setup_http_session()
+    #setup_credentials(username, password, URL)
+    #image_details_url = ""
+
+
+    repository = ''
+    registry = ''
+    counter = 0
+    while counter <= 10:
+        #container_detail_list, container_details_url_status = Get_Call(username,password,container_details_url)
+        container_detail_list, container_details_url_status = Get_Call(token,containerWithVuln)
+        logger.debug('{0} - API URL {1} response status: {2} \n'.format(datetime.datetime.utcnow(),containerWithVuln,container_details_url_status))
+        if container_details_url_status == 200:
+            counter = 11
+        else:
+            logger.debug('{0} - API URL {1} error details: {2} \n'.format(datetime.datetime.utcnow(),containerWithVuln, container_detail_list))
+            logger.error('{0} - API URL {1} error encountered retry number {2}\n'.format(datetime.datetime.utcnow(),containerWithVuln, counter))
+            logger.info("Not feeling well - sleeping 10 secs")
+            time.sleep(10)
+            counter += 1
+            if counter == 10:
+                logger.error('{0} - API URL {1} retry limit exceeded\n'.format(datetime.datetime.utcnow(),containerWithVuln))
+                if exitOnError:
+                    logger.critical('{0} - Exiting\n'.format(datetime.datetime.utcnow()))
+                    sys.exit(1)
+                else:
+                    logger.warning('{0} - Continuing\n'.format(datetime.datetime.utcnow()))
+                    continue
+
+    logger.debug("container_detail_list[imageId] = {}".format(str(container_detail_list['imageId'])))
+    logger.debug("Variable passed to containerVulnDetails imageShareData = {}".format(str(imageShareData)[:200]))
+    #logger.debug("imageShareData[{0}] type is {1}".format(str(container_detail_list['imageId']), type(imageShareData[str(container_detail_list['imageId'])])))
+    if str(container_detail_list['imageId']) in imageShareData.keys():
+        logger.debug("*** Container imageId is in imageShareData --- {}".format(str(imageShareData[str(container_detail_list['imageId'])])))
+        logger.debug("str(imageShareData[str(container_detail_list['imageId'])]['registry']) == {}".format(str(imageShareData[str(container_detail_list['imageId'])]['registry'])))
+        logger.debug("str(imageShareData[str(container_detail_list['imageId'])]['repository']) == {}".format(str(imageShareData[str(container_detail_list['imageId'])]['repository'])))
+
+        logger.debug("imageShareData = {}".format(str(imageShareData)[:1000]))
+
+        registry = str(imageShareData[str(container_detail_list['imageId'])]['registry'])
+        repository = str(imageShareData[str(container_detail_list['imageId'])]['repository'])
+        image_log4j = str(imageShareData[str(container_detail_list['imageId'])]['image-log4j-vuln'])
+    else:
+        logger.debug("ImageId not in imageShareData")
+        registry = ""
+        repository = ""
+        image_log4j = ""
+
+    logger.debug("Container Image Registry = {}".format(registry))
+    logger.debug("Container Image Repository = {}".format(repository))
+    if container_detail_list['host'] is not None:
+        if container_detail_list['host']["ipAddress"] is not None:
+            hostIpAddress = container_detail_list['host']['ipAddress']
+        else:
+            hostIpAddress = ""
+    else:
+        hostIpAddress = ""
+
+    if container_detail_list['host']:
+        hostname = container_detail_list['host']['hostname']
+    else:
+        hostname = ""
+    containerVulnData = []
+
+
+
+    #Iterate through Vulnerabilities
+
+    if container_detail_list['vulnerabilities']:
+        logger.debug("container vulnerabilities : \n\n {}".format(str(container_detail_list['vulnerabilities'])))
+        #log4j =any(item in container_detail_list['vulnerabilities'] for item in log4j_qids)
+        if 376157 in container_detail_list['vulnerabilities'] or 376178 in container_detail_list['vulnerabilities'] or 376194 in container_detail_list['vulnerabilities'] or 376209 in container_detail_list['vulnerabilities']:
+            log4j = True
+        else:
+            log4j = False
+        for vulns in container_detail_list['vulnerabilities']:
+            if vulns['patchAvailable']:
+                patchable = vulns['patchAvailable']
+            else:
+                patchable = 'False'
+
+            firstFound = vulns['firstFound'][0:10]
+            firstDate = str(datetime.datetime.utcfromtimestamp(float(firstFound)).strftime('%Y-%m-%d %H:%M:%S'))
+            softwarePackage = []
+            currentVersion = []
+            fixVersion = []
+            cves = []
+            #if vulns['qid'] == 376157 or vulns['qid'] == 376178 or vulns['qid'] == 376194 or vulns['qid'] == 376209:
+            #    log4j = True
+            if args.software:
+                if vulns['cveids']:
+                    for cve in vulns['cveids']:
+                        cves.append(str(cve))
+                    logger.debug("CVEs found: {}".format(str(cves)))
+                if vulns['software']:
+                    for software in vulns['software']:
+                        row = {"registry": registry, "repository": repository, "imageId": container_detail_list['imageId'], "containerId": container_detail_list['containerId'], "name": container_detail_list['name'], "hostname": hostname, "ipAddress": hostIpAddress,"image-log4j-vuln": image_log4j, "container-log4j-vuln": log4j, "qid": vulns['qid'], "severity": vulns['severity'], "cves": str(cves).strip('[]'), "firstFound": firstDate, "title": vulns['title'], "typeDetected": vulns['typeDetected'], "patchAvailable": str(patchable), 'softwarePackage': str(software['name']), 'currentVersion': str(software['version']), 'fixVersion': str(software['fixVersion'])}
+                        containerVulnData.append(dict(row))
+                else:
+                    row = {"registry": registry, "repository": repository, "imageId": container_detail_list['imageId'], "containerId": container_detail_list['containerId'], "name": container_detail_list['name'], "hostname": hostname, "ipAddress": hostIpAddress, "image-log4j-vuln": image_log4j, "container-log4j-vuln": log4j, "qid": vulns['qid'], "severity": vulns['severity'], "cves": str(cves).strip('[]'), "firstFound": firstDate, "title": vulns['title'], "typeDetected": vulns['typeDetected'], "patchAvailable": str(patchable), 'softwarePackage': '', 'currentVersion': '', 'fixVersion': ''}
+                    containerVulnData.append(dict(row))
+
+            else:
+                if vulns['software']:
+                    for software in vulns['software']:
+                        if software['name'] is not None:
+                            softwarePackage.append(str(software['name']))
+                        if software['version'] is not None:
+                            currentVersion.append(str(software['version']))
+                        if software['fixVersion'] is not None:
+                            fixVersion.append(str(software['fixVersion']))
+
+                if vulns['cveids']:
+                    for cve in vulns['cveids']:
+                        # old code for previous version writing out to CSV directly
+                        #row = "{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13}\n".format(registry,repository,container['imageId'],container['containerId'],container['name'],hostname,container['host']['ipAddress'],vulns['qid'],vulns['severity'],str(cves),firstDate,vulns['title'],vulns['typeDetected'],str(patchable))
+                        logger.debug("CVE Info registry {}".format(registry))
+                        logger.debug("CVE Info repoistory {}".format(repository))
+                        logger.debug("CVE Info imageId {}".format(container_detail_list['imageId']))
+                        logger.debug("CVE Info container ID {}".format(container_detail_list['containerId']))
+                        logger.debug("CVE Info container name {}".format(container_detail_list['name']))
+                        logger.debug("CVE Info hostname {}".format(hostname))
+                        logger.debug("CVE Info ip address {}".format(hostIpAddress))
+                        logger.debug("CVE Info qid {}".format(vulns['qid']))
+                        logger.debug("CVE Info severity {}".format(vulns['severity']))
+                        logger.debug("CVE Info cve {}".format(str(cve)))
+                        logger.debug("CVE Info firstFound {}".format(firstDate))
+                        logger.debug("CVE Info title {}".format(vulns['title']))
+                        logger.debug("CVE Info type detected {}".format(vulns['typeDetected']))
+                        logger.debug("CVE Info patchAvailable {}".format(str(patchable)))
+                        logger.debug("CVE Info softwarePAckage {}".format(str(softwarePackage).strip('[]')))
+                        logger.debug("CVE Info currentVersion {}".format(str(currentVersion).strip('[]')))
+                        logger.debug("CVE Info fixVersion {}".format(str(fixVersion).strip('[]')))
+
+                        row = {"registry": registry, "repository": repository, "imageId": container_detail_list['imageId'], "containerId": container_detail_list['containerId'], "name": container_detail_list['name'], "hostname": hostname, "ipAddress": hostIpAddress, "image-log4j-vuln": image_log4j, "container-log4j-vuln": log4j, "qid": vulns['qid'], "severity": vulns['severity'], "cves": str(cve), "firstFound": firstDate, "title": vulns['title'], "typeDetected": vulns['typeDetected'], "patchAvailable": str(patchable), 'softwarePackage': str(softwarePackage).strip('[]'), 'currentVersion': str(currentVersion).strip('[]'), 'fixVersion': str(fixVersion).strip('[]') }
+                        containerVulnData.append(dict(row))
+                        #ofile.write(row)
+                else:
+                    # old code for previous version writing out to CSV directly
+                    #row = "{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13}\n".format(registry,repository,container['imageId'],container['containerId'],container['name'],hostname,container['host']['ipAddress'],vulns['qid'],vulns['severity'],"",firstDate,vulns['title'],vulns['typeDetected'],str(patchable))
+
+                    row = {"registry": registry, "repository": repository, "imageId": container_detail_list['imageId'], "containerId": container_detail_list['containerId'], "name": container_detail_list['name'], "hostname": hostname, "ipAddress": hostIpAddress,  "image-log4j-vuln": image_log4j, "container-log4j-vuln": log4j, "qid": vulns['qid'], "severity": vulns['severity'], "cves": "", "firstFound": firstDate, "title": vulns['title'], "typeDetected": vulns['typeDetected'], "patchAvailable": str(patchable), 'softwarePackage': str(softwarePackage).strip('[]'), 'currentVersion': str(currentVersion).strip('[]'), 'fixVersion': str(fixVersion).strip('[]')}
+                    containerVulnData.append(dict(row))
+                    #ofile.write(row)
+    else:
+        logger.info('{0} - *** No container vulnerabilities reported \n'.format(datetime.datetime.utcnow()))
+    logger.debug("containerVulnData == \n {}".format(str(containerVulnData)[:100]))
+    logger.debug('------------------------------Container End Debug Log {0} --------------------------------\n'.format(datetime.datetime.utcnow()))
+    return containerVulnData
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--thread", "-t", help="Run report generation via Python ThreadPoolExecutor with number of threads defined in ./config.yml", action="store_true")
+parser.add_argument("--software", "-s", help="Create report with row per software package in the CSV report", action="store_true")
+parser.add_argument("--updated", "-u", help="pull images based on updated field, in Linux epoch time")
+parser.add_argument("--recordprogress", "-r", help="Store last retrieved image updated time stamp and store in tracking file", action="store_true")
+parser.add_argument("--imagesonly", "-i", help="Store last retrieved image updated time stamp and store in tracking file", action="store_true")
+parser.add_argument("--showonlylog4jqid", "-l", help="Show only log4j QIDs in images and container CSV report", action="store_true")
+
+
+args = parser.parse_args()
+
+if __name__ == '__main__':
+    setup_logging()
+    logger = logging.getLogger(__name__)
+    setup_http_session()
+    imageShareData, lastUpdated = image_vuln_csv()
+    if args.recordprogress:
+        setConfig(lastUpdated)
+    if not args.imagesonly:
+        container_vuln_csv(imageShareData)
