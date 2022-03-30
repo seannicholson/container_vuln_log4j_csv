@@ -13,6 +13,7 @@
 # 03.30.2020 - v1.1.3 Add imagesonly option, pull by image updated greater than specified epochTime value,
 #              --recordprogress option, and bug fixes
 # 11.04.2021 - v1.1.4 Changed to use gateway with auth token, added some data validations and sanity debugging logging
+# 03.30.2022 - v1.1.5 Added columns in report for log4j true/false, for both image and container CSVs
 
 from __future__ import print_function
 from builtins import str
